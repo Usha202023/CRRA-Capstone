@@ -1,353 +1,507 @@
 """
-orchestrator/supervisor.py - CRRA contract renewal review as a LangGraph StateGraph.
+CRRA Lab C4 — Supervisor (LangGraph orchestration + human-in-the-loop + audit)
 
-    analysis --> policy_check --(hitl_required)--> hitl --> report --> END
-                              \\--(otherwise)--------------> report
+Runs each contract through a four-node graph:
 
-Run from the project root (contract shim must be running on port 5001):
-    python orchestrator/supervisor.py                 # reviews CTR-1004
-    python orchestrator/supervisor.py CTR-1004 CTR-1006
+    analysis -> policy_check -> (hitl) -> report
+
+    analysis      fetches the contract from the mock API (Lab C2), then lets the
+                  model search the policy KB (Lab C1) and submit a recommendation.
+    policy_check  plain Python, no model call: decides whether a human must approve.
+    hitl          shows the recommendation and asks a named human to approve it.
+    report        sets the final status.
+
+Every node writes to logs/audit_trail.jsonl through guardrails/audit_logger.py.
+
+Prerequisites:
+    1. python data/kb_setup.py                  (Lab C1, loads the policy KB)
+    2. python mcp_server/contract_shim.py       (Lab C2, in a second terminal)
+
+Run from the project root, with ANTHROPIC_API_KEY set (or in .env):
+    python orchestrator/supervisor.py                      # the five test contracts
+    python orchestrator/supervisor.py CTR-1004 CTR-1006    # any contract IDs
 """
 
 import sys
 from pathlib import Path
 
-# Make the project root importable so `guardrails` resolves when run as a script
+# Make the project root importable so "guardrails" resolves when this file is run
+# directly as `python orchestrator/supervisor.py`.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
 
-import json  # noqa: E402
-import os  # noqa: E402
-import urllib.error  # noqa: E402
-import urllib.request  # noqa: E402
-from typing import Any, TypedDict  # noqa: E402
+import json
+from typing import TypedDict
 
-import anthropic  # noqa: E402
-import chromadb  # noqa: E402
-from langgraph.graph import END, START, StateGraph  # noqa: E402
+import anthropic
+import chromadb
+import requests
+from dotenv import load_dotenv
+from langgraph.graph import END, START, StateGraph
 
-from guardrails.audit_logger import AuditLogger  # noqa: E402
+from guardrails.audit_logger import AuditLogger
 
-try:  # optional: load ANTHROPIC_API_KEY from a .env file in the project root
-    from dotenv import load_dotenv
-    load_dotenv(PROJECT_ROOT / ".env")
-except ImportError:
-    pass
+load_dotenv()
 
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
 MODEL = "claude-opus-5"
-OUTPUT_CONFIG = {"effort": "medium"}       # temperature is not supported on this model
-MAX_TOKENS = 4096
-MAX_ROUNDS = 5
+MAX_TOKENS = 16000
+MAX_ROUNDS = 5  # hard cap on model calls per contract
 
-CONTRACT_API = "http://localhost:5001/api/contracts/{contract_id}"
-CHROMA_DIR = PROJECT_ROOT / "data" / "chroma_db"
-COLLECTION_NAME = "crra_policy"
+CONTRACT_API = "http://localhost:5001"
+HTTP_TIMEOUT = 10
 
-RECOMMENDATIONS = ["RENEW", "RENEGOTIATE", "RIGHTSIZE", "CONSOLIDATE", "TERMINATE"]
-CONFIDENCE_LEVELS = ["HIGH", "MEDIUM", "LOW"]
+CHROMA_PATH = PROJECT_ROOT / "chroma_db"
+KB_DIR = PROJECT_ROOT / "data" / "kb"
+KB_COLLECTION = "crra_policy"
+
+# The C3 test set plus CTR-1010, the one healthy Band A contract, so the
+# auto-approve path (no human needed) is exercised too.
+TEST_CONTRACTS = ["CTR-1003", "CTR-1012", "CTR-1005", "CTR-1006", "CTR-1004", "CTR-1010"]
 
 audit = AuditLogger()
 
 
-# --------------------------------------------------------------------------
-# State
-# --------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════
+# STATE
+# ══════════════════════════════════════════════════════════════
+
 class ContractState(TypedDict, total=False):
     contract_id: str
     contract: dict
-    recommendation: str
-    confidence: str
+    recommendation: str | None
+    confidence: str | None
     rationale: str
     policy_citation: str
-    estimated_annual_impact_inr: float
+    estimated_annual_impact_inr: int
     hitl_required: bool
     hitl_reason: str
     hitl_approved: bool
-    approver: str
+    approver: str | None
     final_status: str
 
 
-# --------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------
-def fetch_contract(contract_id: str) -> dict:
-    url = CONTRACT_API.format(contract_id=contract_id)
-    try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Contract API returned {e.code} for {url}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Cannot reach the contract API at {url} - is contract_shim.py running?") from e
+# ══════════════════════════════════════════════════════════════
+# MODEL CLIENT AND KNOWLEDGE BASE
+# ══════════════════════════════════════════════════════════════
+
+_client = None
 
 
-_collection = None
-
-
-def get_collection():
-    """Open the ChromaDB collection once and reuse it."""
-    global _collection
-    if _collection is None:
-        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        _collection = client.get_collection(COLLECTION_NAME)
-    return _collection
-
-
-def search_policy(query: str, n_results: int = 3) -> list[dict]:
-    n_results = max(1, min(int(n_results or 3), 5))
-    res = get_collection().query(query_texts=[query], n_results=n_results,
-                                 include=["documents", "metadatas", "distances"])
-    hits = []
-    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
-        hits.append({
-            "source": meta.get("source"),
-            "heading": meta.get("heading"),
-            "confidence": round(1 - dist, 3),
-            "text": doc,
-        })
-    return hits
+def get_client():
+    """Created on first use, so the graph can be imported without an API key."""
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()
+    return _client
 
 
 def extract_text(response) -> str:
-    """Return the text of the first content block that has a .text attribute."""
+    """Text of the first block that has a .text attribute.
+
+    A thinking block can come before the text, so response.content[0].text is
+    not safe on this model.
+    """
     for block in response.content:
         if hasattr(block, "text"):
-            return block.text
+            return block.text.strip()
     return ""
 
 
-def approval_band(contract: dict) -> str:
-    if contract.get("approval_band"):
-        return str(contract["approval_band"]).upper()
-    v = int(contract.get("annual_value_inr", 0))
-    return "A" if v < 1_000_000 else ("B" if v <= 5_000_000 else "C")
+_kb = None
 
 
-# --------------------------------------------------------------------------
-# Tool definitions
-# --------------------------------------------------------------------------
+def get_kb():
+    """Open the crra_policy collection, building it from data/kb if it is missing."""
+    global _kb
+    if _kb is not None:
+        return _kb
+
+    kb_client = chromadb.PersistentClient(path=str(CHROMA_PATH))
+    try:
+        _kb = kb_client.get_collection(KB_COLLECTION)
+    except Exception:
+        print(f"  KB collection '{KB_COLLECTION}' not found in {CHROMA_PATH}, building it from data/kb ...")
+        from data.kb_setup import chunk_article  # reuse Lab C1's chunker
+
+        _kb = kb_client.create_collection(KB_COLLECTION, metadata={"hnsw:space": "cosine"})
+        ids, docs, metas = [], [], []
+        for md in sorted(KB_DIR.glob("*.md")):
+            for c in chunk_article(md.read_text(encoding="utf-8"), md.name):
+                ids.append(c["id"])
+                docs.append(c["document"])
+                metas.append(c["metadata"])
+        _kb.add(ids=ids, documents=docs, metadatas=metas)
+        print(f"  Built KB with {len(ids)} chunks.")
+    return _kb
+
+
+# ══════════════════════════════════════════════════════════════
+# TOOLS
+# ══════════════════════════════════════════════════════════════
+
 TOOLS = [
     {
         "name": "search_policy",
         "description": (
-            "Search the Zensar procurement policy knowledge base. Returns the best-matching "
-            "policy sections with source file, section heading and text. Use it to find the "
-            "rules on approvals, renewals, notice periods, utilisation and uplifts before deciding."
+            "Search the BizOps procurement policy knowledge base. Returns the best "
+            "matching section from each of the two most relevant policy files, with "
+            "source file, section heading, confidence (0-1) and the section text. "
+            "Phrase the query as the situation you are deciding about, e.g. "
+            "'vendor proposes 18 percent uplift at renewal'."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Natural-language policy question"},
-                "n_results": {"type": "integer", "minimum": 1, "maximum": 5,
-                              "description": "Number of sections to return (default 3)"},
+                "query": {"type": "string", "description": "Natural-language policy question"}
             },
             "required": ["query"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "submit_recommendation",
-        "description": "Submit the final renewal recommendation. Call exactly once, after checking policy.",
+        "description": "Submit the final recommendation for the contract. Call exactly once, as the last step.",
+        "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {
-                "recommendation": {"type": "string", "enum": RECOMMENDATIONS},
-                "confidence": {"type": "string", "enum": CONFIDENCE_LEVELS},
-                "rationale": {"type": "string",
-                              "description": "2-4 sentences grounded in the contract data and policy"},
-                "policy_citation": {"type": "string",
-                                    "description": "Source file and section heading, e.g. 'renewals.md > Notice periods'"},
+                "recommendation": {
+                    "type": "string",
+                    "enum": ["RENEW", "RENEGOTIATE", "CONSOLIDATE", "TERMINATE"],
+                },
+                "confidence": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                "rationale": {
+                    "type": "string",
+                    "description": "Two to four sentences. State the specific numbers that drove the decision.",
+                },
+                "policy_citation": {
+                    "type": "string",
+                    "description": "Policy file and section relied on, e.g. 'auto_renewal_rules.md > Standard notice windows'.",
+                },
                 "estimated_annual_impact_inr": {
-                    "type": "number",
-                    "description": "Estimated annual saving (positive) or extra cost (negative) in INR",
+                    "type": "integer",
+                    "description": "Change in annual spend in INR if followed; negative means savings, 0 if none.",
                 },
             },
-            "required": ["recommendation", "confidence", "rationale", "policy_citation",
-                         "estimated_annual_impact_inr"],
+            "required": [
+                "recommendation",
+                "confidence",
+                "rationale",
+                "policy_citation",
+                "estimated_annual_impact_inr",
+            ],
+            "additionalProperties": False,
         },
     },
 ]
 
-SYSTEM_PROMPT = f"""You are the Contract Renewal Analysis Agent for Zensar BizOps.
-Review one software/services contract and recommend one of: {", ".join(RECOMMENDATIONS)}.
 
-Process:
-1. Use search_policy to look up the procurement rules that apply (approval bands, notice periods,
-   seat utilisation, price uplifts, ownership). Search more than once if needed.
-2. Base every claim on the contract data provided and the policy text returned. Do not invent rules.
-3. Finish by calling submit_recommendation exactly once. Cite the policy file and section you relied on.
-Use confidence LOW if the policy is unclear or the data is incomplete.
-You have at most {MAX_ROUNDS} rounds."""
+def search_policy(query: str) -> dict:
+    """Best section per policy file, top two files."""
+    kb = get_kb()
+    res = kb.query(query_texts=[query], n_results=min(10, kb.count()))
+
+    best_per_source: dict[str, dict] = {}
+    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
+        src = meta["source"]
+        if src not in best_per_source or dist < best_per_source[src]["distance"]:
+            best_per_source[src] = {"distance": dist, "heading": meta["heading"], "text": doc}
+
+    ranked = sorted(best_per_source.items(), key=lambda kv: kv[1]["distance"])[:2]
+    return {
+        "query": query,
+        "results": [
+            {
+                "source": src,
+                "section": hit["heading"],
+                "confidence": round(1 - hit["distance"], 2),
+                "text": hit["text"],
+            }
+            for src, hit in ranked
+        ],
+    }
 
 
-# --------------------------------------------------------------------------
-# Nodes
-# --------------------------------------------------------------------------
+SYSTEM_PROMPT = """You are the Renewal Analysis Agent for Zensar BizOps procurement.
+
+You are given one contract's full record. Decide exactly one recommendation:
+- RENEW: keep the contract on its current terms.
+- RENEGOTIATE: keep the vendor but push back on price, seats or terms.
+- CONSOLIDATE: another vendor in the same category covers this need; merge onto one.
+- TERMINATE: the capability itself is no longer required.
+
+How to work:
+1. Read notice_state, days_to_notice_deadline, utilisation_pct, proposed_uplift_pct,
+   approval_band, auto_renew and owner from the contract record.
+2. Call search_policy for the rule that governs your decision (one or two searches).
+3. Finish by calling submit_recommendation exactly once. You have at most 5 turns,
+   so do not repeat a search you already have.
+
+Rules:
+- Base every claim on the contract data and the policy text. Cite the policy file
+  and section you relied on in policy_citation.
+- Proposed uplift above 15% is never accepted at first offer; that is RENEGOTIATE.
+- An absent owner is not by itself a reason to TERMINATE; nobody has confirmed the
+  capability is unneeded.
+- estimated_annual_impact_inr is the change in annual spend in INR if the
+  recommendation is followed: negative for savings, positive for added cost, 0 if none.
+
+Confidence:
+- HIGH: the data and a specific policy rule clearly point to one answer.
+- MEDIUM: one answer is best, but it rests on an assumption you should name.
+- LOW: the data is missing or contradictory, or the policy does not cover the case.
+LOW is a valid answer. It sends the contract to a human, which is better than a
+confident guess."""
+
+
+# ══════════════════════════════════════════════════════════════
+# NODES
+# ══════════════════════════════════════════════════════════════
+
+def fetch_contract(contract_id: str) -> dict:
+    try:
+        r = requests.get(f"{CONTRACT_API}/api/contracts/{contract_id}", timeout=HTTP_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Contract API unreachable ({type(e).__name__}). Is contract_shim.py running on port 5001?"}
+    if r.status_code == 404:
+        return {"error": f"{contract_id} not found"}
+    if not r.ok:
+        return {"error": f"Contract API returned HTTP {r.status_code}"}
+    return r.json()
+
+
+def _no_recommendation(contract_id: str, contract: dict, reason: str) -> dict:
+    audit.log("analysis", "no_recommendation", contract_id, reason=reason)
+    return {
+        "contract": contract,
+        "recommendation": None,
+        "confidence": "LOW",
+        "rationale": reason,
+        "policy_citation": "",
+        "estimated_annual_impact_inr": 0,
+    }
+
+
 def analysis_node(state: ContractState) -> dict:
-    cid = state["contract_id"]
-    audit.log("analysis", "start", cid)
+    contract_id = state["contract_id"]
+    print(f"\n{'=' * 62}\nANALYSING: {contract_id}\n{'=' * 62}")
 
-    contract = fetch_contract(cid)
-    audit.log("analysis", "contract_fetched", cid, vendor=contract.get("vendor"),
-              annual_value_inr=contract.get("annual_value_inr"),
-              notice_state=contract.get("notice_state"))
+    contract = fetch_contract(contract_id)
+    if "error" in contract:
+        audit.log("analysis", "contract_fetch_failed", contract_id, error=contract["error"])
+        return _no_recommendation(contract_id, {}, contract["error"])
 
-    client = anthropic.Anthropic()
-    messages: list[dict[str, Any]] = [{
-        "role": "user",
-        "content": "Review this contract and submit a renewal recommendation.\n\n"
-                   + json.dumps(contract, indent=2),
-    }]
-    submission: dict | None = None
+    audit.log(
+        "analysis",
+        "contract_fetched",
+        contract_id,
+        vendor=contract.get("vendor"),
+        annual_value_inr=contract.get("annual_value_inr"),
+        approval_band=contract.get("approval_band"),
+        notice_state=contract.get("notice_state"),
+        owner=contract.get("owner"),
+    )
 
-    for round_no in range(1, MAX_ROUNDS + 1):
-        response = client.messages.create(
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                f"Analyse contract {contract_id} and submit your renewal recommendation.\n\n"
+                f"Contract record:\n{json.dumps(contract, indent=2)}"
+            ),
+        }
+    ]
+
+    for rounds in range(1, MAX_ROUNDS + 1):
+        response = get_client().messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
-            output_config=OUTPUT_CONFIG,
+            output_config={"effort": "medium"},  # temperature is not supported on this model
         )
+
         text = extract_text(response)
-        tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
-        audit.log("analysis", "model_round", cid, round=round_no, stop_reason=response.stop_reason,
-                  tools_called=[t.name for t in tool_uses], text=text[:500])
+        if text:
+            print(f"  [round {rounds}] {text[:200]}")
 
-        # Keep the assistant turn exactly as returned (including any thinking blocks)
+        tool_calls = [b for b in response.content if b.type == "tool_use"]
+        if response.stop_reason != "tool_use" or not tool_calls:
+            return _no_recommendation(
+                contract_id, contract, f"Agent stopped ({response.stop_reason}) without submitting a recommendation."
+            )
+
+        # Keep the full content, thinking blocks included, so the next request is valid.
         messages.append({"role": "assistant", "content": response.content})
-
-        if not tool_uses:
-            messages.append({"role": "user",
-                             "content": "Please call submit_recommendation with your final answer."})
-            continue
-
         tool_results = []
-        for tu in tool_uses:
-            if tu.name == "submit_recommendation":
-                submission = dict(tu.input)
-                audit.log("analysis", "recommendation_submitted", cid, round=round_no, **submission)
-                break
-            if tu.name == "search_policy":
-                try:
-                    hits = search_policy(**tu.input)
-                    audit.log("analysis", "search_policy", cid, query=tu.input.get("query"),
-                              results=[f"{h['source']} > {h['heading']} ({h['confidence']})" for h in hits])
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                         "content": json.dumps(hits, ensure_ascii=False)})
-                except Exception as e:  # report tool errors back to the model
-                    audit.log("analysis", "tool_error", cid, tool=tu.name, error=str(e))
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                         "content": f"Error: {e}", "is_error": True})
-            else:
-                tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                     "content": f"Unknown tool '{tu.name}'", "is_error": True})
 
-        if submission is not None:
-            break
+        for call in tool_calls:
+            if call.name == "submit_recommendation":
+                rec = call.input
+                audit.log("analysis", "recommendation_submitted", contract_id, rounds=rounds, **rec)
+                return {"contract": contract, **rec}
+
+            if call.name == "search_policy":
+                try:
+                    result = search_policy(call.input["query"])
+                    is_error = False
+                    audit.log(
+                        "analysis",
+                        "policy_search",
+                        contract_id,
+                        query=call.input["query"],
+                        hits=[f"{r['source']} > {r['section']} ({r['confidence']})" for r in result["results"]],
+                    )
+                except Exception as e:  # report to the model rather than crash the graph
+                    result = {"error": f"policy KB unavailable: {type(e).__name__}: {e}"}
+                    is_error = True
+                    audit.log("analysis", "policy_search_failed", contract_id, error=result["error"])
+            else:
+                result = {"error": f"unknown tool {call.name}"}
+                is_error = True
+
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call.id,
+                    "content": json.dumps(result),
+                    "is_error": is_error,
+                }
+            )
+
         messages.append({"role": "user", "content": tool_results})
 
-    if submission is None:
-        audit.log("analysis", "no_recommendation", cid, rounds=MAX_ROUNDS)
-        submission = {
-            "recommendation": "NO_RECOMMENDATION",
-            "confidence": "LOW",
-            "rationale": f"The analysis agent did not submit a recommendation within {MAX_ROUNDS} rounds.",
-            "policy_citation": "",
-            "estimated_annual_impact_inr": 0,
-        }
-
-    return {
-        "contract": contract,
-        "recommendation": str(submission.get("recommendation", "")).upper(),
-        "confidence": str(submission.get("confidence", "LOW")).upper(),
-        "rationale": submission.get("rationale", ""),
-        "policy_citation": submission.get("policy_citation", ""),
-        "estimated_annual_impact_inr": float(submission.get("estimated_annual_impact_inr") or 0),
-    }
+    return _no_recommendation(
+        contract_id, contract, f"Stopped after {MAX_ROUNDS} rounds with no recommendation."
+    )
 
 
 def policy_check_node(state: ContractState) -> dict:
-    """Deterministic guardrail - no model call. Collects every reason that needs a human."""
-    cid = state["contract_id"]
-    contract = state.get("contract", {})
-    reasons: list[str] = []
+    """Deterministic guardrail: collect every reason a human must approve."""
+    contract = state.get("contract") or {}
+    recommendation = state.get("recommendation")
+    reasons = []
 
-    band = approval_band(contract)
+    if recommendation is None:
+        reasons.append("Agent produced no recommendation")
+
+    band = contract.get("approval_band")
     if band in ("B", "C"):
-        reasons.append(f"Approval band {band} (annual value INR {contract.get('annual_value_inr', 0):,})")
-    if str(contract.get("notice_state", "")).upper() == "INSIDE_WINDOW":
-        reasons.append(f"Inside notice window (notice deadline {contract.get('notice_deadline')})")
-    if state.get("recommendation") == "TERMINATE":
-        reasons.append("Recommendation is TERMINATE")
-    if state.get("confidence") == "LOW":
-        reasons.append("Model confidence is LOW")
-    if str(contract.get("owner", "")).strip().upper() == "UNASSIGNED":
-        reasons.append("Contract owner is UNASSIGNED")
+        reasons.append(f"Approval band {band} requires a named human approver")
 
-    result = {"hitl_required": bool(reasons), "hitl_reason": "; ".join(reasons)}
-    audit.log("policy_check", "evaluated", cid, approval_band=band, **result)
-    return result
+    if contract.get("notice_state") == "INSIDE_WINDOW":
+        reasons.append(
+            f"Contract is inside its notice window (notice deadline {contract.get('notice_deadline')})"
+        )
+
+    # Sixth trigger: an auto-renewing contract with its notice deadline coming up is
+    # the one case where doing nothing is itself a decision. If nobody sends notice
+    # by the deadline, the vendor renews for a full term at their price, whatever
+    # the value or the recommendation (auto_renewal_rules.md > Why auto-renewal is a risk).
+    if contract.get("auto_renew") is True and contract.get("notice_state") == "APPROACHING":
+        reasons.append(
+            f"Auto-renews unless written notice is sent by {contract.get('notice_deadline')} "
+            f"({contract.get('days_to_notice_deadline')} days away). If nobody acts, it renews on "
+            f"{contract.get('renewal_date')} for a full term at the vendor's price "
+            f"(proposed uplift {contract.get('proposed_uplift_pct')}%) and the leverage to "
+            "renegotiate is lost, so a person must decide before the deadline"
+        )
+
+    if recommendation == "TERMINATE":
+        reasons.append("TERMINATE recommendations always need human sign-off")
+
+    if state.get("confidence") == "LOW":
+        reasons.append("Agent confidence is LOW")
+
+    owner = (contract.get("owner") or "").strip().upper()
+    if contract and owner in ("", "UNASSIGNED"):
+        reasons.append("Contract has no business owner (UNASSIGNED)")
+
+    hitl_required = bool(reasons)
+    hitl_reason = "; ".join(reasons)
+
+    print(f"  Policy check: {'HUMAN APPROVAL REQUIRED' if hitl_required else 'auto-approvable'}")
+    for r in reasons:
+        print(f"    - {r}")
+
+    audit.log(
+        "policy_check",
+        "policy_checked",
+        state["contract_id"],
+        hitl_required=hitl_required,
+        reasons=reasons,
+    )
+    return {"hitl_required": hitl_required, "hitl_reason": hitl_reason}
 
 
 def hitl_node(state: ContractState) -> dict:
-    cid = state["contract_id"]
-    c = state.get("contract", {})
-    audit.log("hitl", "review_requested", cid, hitl_reason=state.get("hitl_reason"))
+    contract_id = state["contract_id"]
+    contract = state.get("contract") or {}
+    impact = state.get("estimated_annual_impact_inr") or 0
 
-    print("\n" + "=" * 70)
-    print(f"  HUMAN REVIEW REQUIRED - {cid} ({c.get('vendor')})")
-    print("=" * 70)
-    print(f"  Recommendation : {state.get('recommendation')}  (confidence {state.get('confidence')})")
-    print(f"  Annual impact  : INR {state.get('estimated_annual_impact_inr', 0):,.0f}")
-    print(f"  Rationale      : {state.get('rationale')}")
-    print(f"  Policy         : {state.get('policy_citation')}")
-    print("  Review reasons :")
-    for r in (state.get("hitl_reason") or "").split("; "):
-        print(f"    - {r}")
-    print("=" * 70)
+    print(f"\n  +-- HUMAN APPROVAL NEEDED: {contract_id} {'-' * 30}")
+    print(f"  | Vendor:          {contract.get('vendor', '?')}  (owner {contract.get('owner', '?')})")
+    print(f"  | Recommendation:  {state.get('recommendation') or 'NONE'}   confidence {state.get('confidence')}")
+    print(f"  | Impact:          INR {impact:+,}/yr")
+    print(f"  | Policy:          {state.get('policy_citation') or '-'}")
+    print(f"  | Rationale:       {state.get('rationale', '')}")
+    print("  | Why a human is needed:")
+    for r in state.get("hitl_reason", "").split("; "):
+        print(f"  |   - {r}")
+    print(f"  +{'-' * 60}")
 
     try:
         while True:
-            answer = input("Approve this recommendation? [y/n]: ").strip().lower()
+            answer = input("  Approve this recommendation? [y/n] ").strip().lower()
             if answer in ("y", "yes", "n", "no"):
                 break
-            print("Please type y or n.")
-        approved = answer.startswith("y")
-        approver = ""
+            print("  Please answer y or n.")
+        approved = answer in ("y", "yes")
+
+        approver = None
         if approved:
             while not approver:
-                approver = input("Approver name: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\nNo input received - treating as rejected.")
-        approved, approver = False, ""
+                approver = input("  Approver name: ").strip()
+    except EOFError:  # no terminal attached: never approve by default
+        print("\n  No input available, treating as rejected.")
+        approved, approver = False, None
 
-    audit.log("hitl", "decision", cid, approved=approved, approver=approver or None)
+    audit.log(
+        "hitl",
+        "human_decision",
+        contract_id,
+        approved=approved,
+        approver=approver,
+        recommendation=state.get("recommendation"),
+        hitl_reason=state.get("hitl_reason"),
+    )
     return {"hitl_approved": approved, "approver": approver}
 
 
 def report_node(state: ContractState) -> dict:
-    cid = state["contract_id"]
-    rec = state.get("recommendation") or "NO_RECOMMENDATION"
+    contract_id = state["contract_id"]
+    rec = state.get("recommendation")
 
     if not state.get("hitl_required"):
         final_status = f"{rec}_AUTO"
-    elif state.get("hitl_approved"):
+    elif state.get("hitl_approved") and rec:
         final_status = f"{rec}_APPROVED"
     else:
         final_status = "ON_HOLD_REJECTED"
 
-    audit.log("report", "final", cid, final_status=final_status, recommendation=rec,
-              confidence=state.get("confidence"),
-              estimated_annual_impact_inr=state.get("estimated_annual_impact_inr"),
-              policy_citation=state.get("policy_citation"),
-              hitl_required=state.get("hitl_required"), hitl_reason=state.get("hitl_reason"),
-              approver=state.get("approver") or None)
-
-    print(f"\n>>> {cid}: {final_status}")
+    print(f"  Final status: {final_status}")
+    audit.log(
+        "report",
+        "final_status",
+        contract_id,
+        final_status=final_status,
+        recommendation=rec,
+        confidence=state.get("confidence"),
+        estimated_annual_impact_inr=state.get("estimated_annual_impact_inr"),
+        hitl_required=state.get("hitl_required"),
+        approver=state.get("approver"),
+    )
     return {"final_status": final_status}
 
 
@@ -355,9 +509,10 @@ def route_after_policy_check(state: ContractState) -> str:
     return "hitl" if state.get("hitl_required") else "report"
 
 
-# --------------------------------------------------------------------------
-# Graph
-# --------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════
+# GRAPH
+# ══════════════════════════════════════════════════════════════
+
 def build_graph():
     graph = StateGraph(ContractState)
     graph.add_node("analysis", analysis_node)
@@ -367,38 +522,44 @@ def build_graph():
 
     graph.add_edge(START, "analysis")
     graph.add_edge("analysis", "policy_check")
-    graph.add_conditional_edges("policy_check", route_after_policy_check,
-                                {"hitl": "hitl", "report": "report"})
+    graph.add_conditional_edges(
+        "policy_check", route_after_policy_check, {"hitl": "hitl", "report": "report"}
+    )
     graph.add_edge("hitl", "report")
     graph.add_edge("report", END)
     return graph.compile()
 
 
-def main() -> None:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY is not set (set it in your shell or a .env file in the project root).")
+def print_summary(results: list[dict]) -> None:
+    print(f"\n\n{'=' * 78}\nPORTFOLIO SUMMARY\n{'=' * 78}")
+    print(f"{'Contract':<11}{'Action':<14}{'Conf':<8}{'Final status':<24}{'Approver':<14}Impact INR/yr")
+    print("-" * 78)
+    for r in results:
+        impact = r.get("estimated_annual_impact_inr") or 0
+        print(
+            f"{r['contract_id']:<11}{r.get('recommendation') or 'NONE':<14}{r.get('confidence') or '-':<8}"
+            f"{r.get('final_status', '-'):<24}{r.get('approver') or '-':<14}{impact:+,}"
+        )
+    print("-" * 78)
+    print(f"Audit trail: {audit.log_path}")
 
-    contract_ids = sys.argv[1:] or ["CTR-1004"]
+
+def main(contract_ids: list[str]) -> None:
     app = build_graph()
-    audit.log("supervisor", "run_start", None, contract_ids=contract_ids, model=MODEL)
+    audit.log("supervisor", "run_started", contract_ids=contract_ids, model=MODEL)
 
-    summary = []
+    results = []
     for cid in contract_ids:
         try:
-            final = app.invoke({"contract_id": cid.upper()})
-            summary.append((cid.upper(), final.get("final_status")))
-        except Exception as e:
-            audit.log("supervisor", "error", cid.upper(), error=str(e))
-            summary.append((cid.upper(), f"ERROR: {e}"))
+            results.append(app.invoke({"contract_id": cid}))
+        except anthropic.APIError as e:
+            print(f"  API error on {cid}: {e}")
+            audit.log("supervisor", "api_error", cid, error=f"{type(e).__name__}: {e}")
+            results.append({"contract_id": cid, "final_status": "ERROR"})
 
-    print("\n" + "=" * 70)
-    print("  SUMMARY")
-    for cid, status in summary:
-        print(f"  {cid:<10} {status}")
-    print(f"  Audit trail: {audit.log_path}")
-    print("=" * 70)
-    audit.log("supervisor", "run_end", None, results=dict(summary))
+    audit.log("supervisor", "run_finished", processed=len(results))
+    print_summary(results)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:] or TEST_CONTRACTS)
